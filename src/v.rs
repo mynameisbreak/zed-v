@@ -4,34 +4,82 @@ use zed_extension_api::{self as zed, CodeLabelSpanLiteral, Result};
 
 struct VExtension {
 	current_version: String,
-	cached_binary_path: Option<String>
+	cached_binary_path: Option<String>,
 }
 
-fn try_local_install<T>(err: T, worktree: &zed::Worktree) -> Result<String, T> {
-	if let Some(path) = worktree.which("vls") {
-		return Ok(path);
-	}
-	return Err(err);
-}
-
-fn language_server_binary_path_no_fallback(
-	selff: &mut VExtension,
-	language_server_id: &LanguageServerId,
-	worktree: &zed::Worktree,
-) -> Result<String> {
-	if let Some(cache) = selff.cached_binary_path.clone() {
-		if let Some(local) = worktree.which("vls") {
-			if local != cache && fs::metadata(&cache).map_or(false, |stat| stat.is_file()) {
-				return Ok(cache);
-			}
-		} else {
-			return Ok(cache);
+/// Prefer an already-installed VLS over downloading one.
+fn find_local_vls(worktree: &zed::Worktree) -> Option<String> {
+	if let Ok(explicit) = std::env::var("VLS_PATH") {
+		let path = explicit.trim();
+		if !path.is_empty() && fs::metadata(path).map(|s| s.is_file()).unwrap_or(false) {
+			return Some(path.to_string());
 		}
 	}
 
+	if let Some(path) = worktree.which("vls") {
+		return Some(path);
+	}
+	// Windows installs often use vls.exe even when which("vls") is picky.
+	if let Some(path) = worktree.which("vls.exe") {
+		return Some(path);
+	}
+
+	// Keep a copy next to the V compiler discoverable without PATH changes.
+	if let Some(v) = find_v_compiler(worktree) {
+		if let Some(dir) = parent_dir(&v) {
+			for name in ["vls", "vls.exe"] {
+				let candidate = join_path(&dir, name);
+				if fs::metadata(&candidate).map(|s| s.is_file()).unwrap_or(false) {
+					return Some(candidate);
+				}
+			}
+		}
+	}
+
+	None
+}
+
+fn find_v_compiler(worktree: &zed::Worktree) -> Option<String> {
+	if let Ok(explicit) = std::env::var("VLS_V_COMMAND") {
+		let path = explicit.trim();
+		if !path.is_empty() && fs::metadata(path).map(|s| s.is_file()).unwrap_or(false) {
+			return Some(path.to_string());
+		}
+	}
+	if let Some(path) = worktree.which("v") {
+		return Some(path);
+	}
+	if let Some(path) = worktree.which("v.exe") {
+		return Some(path);
+	}
+	None
+}
+
+fn parent_dir(path: &str) -> Option<String> {
+	let idx = path.rfind(['/', '\\'])?;
+	if idx == 0 {
+		return Some(path[..1].to_string());
+	}
+	Some(path[..idx].to_string())
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+	if dir.ends_with('/') || dir.ends_with('\\') {
+		format!("{dir}{name}")
+	} else if dir.contains('\\') {
+		format!("{dir}\\{name}")
+	} else {
+		format!("{dir}/{name}")
+	}
+}
+
+fn download_vls(
+	selff: &mut VExtension,
+	language_server_id: &LanguageServerId,
+) -> Result<String> {
 	let (platform, arch) = zed::current_platform();
 	zed::set_language_server_installation_status(
-		&language_server_id,
+		language_server_id,
 		&zed::LanguageServerInstallationStatus::CheckingForUpdate,
 	);
 
@@ -49,10 +97,10 @@ fn language_server_binary_path_no_fallback(
 		},
 		extension = match platform {
 			zed::Os::Windows => ".exe",
-			_ => ""
+			_ => "",
 		},
 	);
-	
+
 	let release = zed::latest_github_release(
 		"lv37/vls",
 		zed::GithubReleaseOptions {
@@ -60,17 +108,18 @@ fn language_server_binary_path_no_fallback(
 			pre_release: false,
 		},
 	)?;
-	
+
 	let asset = release
 		.assets
 		.iter()
 		.find(|asset| asset.name == asset_name)
 		.ok_or_else(|| format!("no asset found matching {:?}", asset_name))?;
 
-
-	if selff.current_version != asset.download_url || !fs::metadata(&asset_name).map_or(false, |stat| stat.is_file()) {
+	if selff.current_version != asset.download_url
+		|| !fs::metadata(&asset_name).map_or(false, |stat| stat.is_file())
+	{
 		zed::set_language_server_installation_status(
-			&language_server_id,
+			language_server_id,
 			&zed::LanguageServerInstallationStatus::Downloading,
 		);
 
@@ -92,6 +141,7 @@ fn language_server_binary_path_no_fallback(
 			}
 		}
 	}
+
 	selff.cached_binary_path = Some(asset_name.clone());
 	selff.current_version = release.version;
 	Ok(asset_name)
@@ -103,16 +153,29 @@ impl VExtension {
 		language_server_id: &LanguageServerId,
 		worktree: &zed::Worktree,
 	) -> Result<String> {
-		return language_server_binary_path_no_fallback(self, language_server_id, worktree)
-			.or_else(|a| try_local_install(a, worktree));
+		if let Some(local) = find_local_vls(worktree) {
+			return Ok(local);
+		}
+
+		if let Some(cache) = selff_cached_path(self) {
+			if fs::metadata(&cache).map_or(false, |stat| stat.is_file()) {
+				return Ok(cache);
+			}
+		}
+
+		download_vls(self, language_server_id)
 	}
+}
+
+fn selff_cached_path(selff: &VExtension) -> Option<String> {
+	selff.cached_binary_path.clone()
 }
 
 impl zed::Extension for VExtension {
 	fn new() -> Self {
 		Self {
 			cached_binary_path: None,
-			current_version: "".to_string()
+			current_version: "".to_string(),
 		}
 	}
 
@@ -121,10 +184,20 @@ impl zed::Extension for VExtension {
 		language_server_id: &LanguageServerId,
 		worktree: &zed::Worktree,
 	) -> Result<zed::Command> {
+		let command = self.language_server_binary_path(language_server_id, worktree)?;
+
+		// VLS shells out to `v`. Pass an explicit compiler path when we can
+		// find one, so diagnostics/completion work even if `v` is not on the
+		// editor process PATH.
+		let mut env = Vec::new();
+		if let Some(v) = find_v_compiler(worktree) {
+			env.push(("VLS_V_COMMAND".to_string(), v));
+		}
+
 		Ok(zed::Command {
-			command: self.language_server_binary_path(language_server_id, worktree)?,
+			command,
 			args: vec![],
-			env: Default::default(),
+			env,
 		})
 	}
 
@@ -134,42 +207,33 @@ impl zed::Extension for VExtension {
 		completion: zed::lsp::Completion,
 	) -> Option<zed::CodeLabel> {
 		let (highlight_name, label) = match completion.kind {
-		    Some(zed::lsp::CompletionKind::Struct) => ("type", completion.label),
+			Some(zed::lsp::CompletionKind::Struct) => ("type", completion.label),
 			Some(zed::lsp::CompletionKind::Interface) => ("type", completion.label),
 			Some(zed::lsp::CompletionKind::Function) => ("function", completion.label),
 			Some(zed::lsp::CompletionKind::Method) => ("function", completion.label),
 			_ => ("identifier", completion.label),
 		};
 
-		Some(
-    		CodeLabel {
-    			spans: vec![
-    			    Some(
-    					CodeLabelSpan::Literal(
-       					CodeLabelSpanLiteral {
-       					    text: label.clone(),
-      						highlight_name: Some(String::from(highlight_name))
-       					}
-      		        )
-    				),
-    				completion.detail.map(|detail| CodeLabelSpan::Literal(
-    					CodeLabelSpanLiteral {
-    					    text: format!(" {}", detail),
-    						highlight_name: Some(String::from("type"))
-    					}
-    				))
-    			].into_iter().flatten().collect(),
-    			filter_range: (0..label.len()).into(),
-    			code: label,	
-    		}
-		)
+		Some(CodeLabel {
+			spans: vec![
+				Some(CodeLabelSpan::Literal(CodeLabelSpanLiteral {
+					text: label.clone(),
+					highlight_name: Some(String::from(highlight_name)),
+				})),
+				completion.detail.map(|detail| {
+					CodeLabelSpan::Literal(CodeLabelSpanLiteral {
+						text: format!(" {}", detail),
+						highlight_name: Some(String::from("type")),
+					})
+				}),
+			]
+			.into_iter()
+			.flatten()
+			.collect(),
+			filter_range: (0..label.len()).into(),
+			code: label,
+		})
 	}
-}
-
-fn after_first(in_string: &str, delim: char) -> Option<String> {
-	let mut splitter = in_string.splitn(2, delim);
-	splitter.next()?;
-	Some(splitter.next()?.to_string())
 }
 
 zed::register_extension!(VExtension);
